@@ -68,12 +68,14 @@ CRITICAL OUTPUT RULES:
 - Speak directly and conversationally, as if talking to a friend
 - Respond ONLY in English unless the user explicitly asks for another language
 
-TOOL USE:
-- You have access to tools for getting weather and time information
-- When asked about weather, use the get_weather tool to fetch current conditions
-- When asked about time, use the get_current_time tool
-- After using a tool, incorporate the results naturally into your spoken response
-- If a tool fails, apologize briefly and suggest an alternative
+TOOL USE - CRITICAL:
+- You have access to tools - USE THEM, do not just say you will check something
+- NEVER say "let me check" or "one moment" without actually calling a tool
+- For WEATHER: Call get_weather immediately with the location
+- For TIME: Call get_current_time immediately
+- For SHOPPING LIST, CALENDAR, TASKS, SCHEDULE, or any list/dashboard: Call list_views first to get the view ID, then call get_view_data with that ID
+- After the tool returns data, speak the results naturally
+- If a tool fails, briefly apologize and suggest an alternative
 
 Example tool response formats:
 - "It's currently sixty-five degrees and partly cloudy in San Francisco, with a feels-like temperature of sixty-two degrees."
@@ -156,12 +158,21 @@ export async function POST(request: NextRequest) {
       max_tokens: 1024,
     });
 
+    console.log(`[Chat API] Initial response:`, {
+      finish_reason: response.choices[0]?.finish_reason,
+      has_tool_calls: !!response.choices[0]?.message?.tool_calls,
+      tool_calls: response.choices[0]?.message?.tool_calls,
+      content: response.choices[0]?.message?.content?.substring(0, 100),
+    });
+
     // Handle tool use loop (max 5 iterations for safety)
     let iterations = 0;
     const maxIterations = 5;
 
+    // Check for tool calls - some models use finish_reason, others just have tool_calls
     while (
-      response.choices[0]?.finish_reason === "tool_calls" &&
+      (response.choices[0]?.finish_reason === "tool_calls" ||
+       response.choices[0]?.message?.tool_calls?.length > 0) &&
       iterations < maxIterations
     ) {
       iterations++;

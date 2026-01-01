@@ -54,11 +54,15 @@ export default function Home() {
   // Realtime session hook
   const {
     status: realtimeStatus,
+    currentTool: realtimeCurrentTool,
     isConnected: isRealtimeConnected,
     error: realtimeError,
+    failureCount: realtimeFailureCount,
     connect: connectRealtime,
     disconnect: disconnectRealtime,
     interrupt: interruptRealtime,
+    sendTextMessage: sendRealtimeTextMessage,
+    retry: retryRealtime,
   } = useRealtimeSession({
     onMessage: (message) => {
       // Avoid duplicate messages
@@ -84,6 +88,10 @@ export default function Home() {
       }
     },
     onError: (err) => setError(err),
+    onTimeout: () => {
+      // Could auto-suggest classic mode after repeated failures
+      console.log("[Page] Realtime request timed out");
+    },
     contentRating: typeof window !== "undefined" ? localStorage.getItem(CONTENT_RATING_KEY) || "M" : "M",
   });
 
@@ -236,8 +244,20 @@ export default function Home() {
       conversationId = newConvo.id;
     }
 
-    setStatus("processing");
     setTextInput("");
+
+    // In Realtime mode with active connection, send through WebRTC
+    // Otherwise use the Classic API (no microphone needed for text input)
+    console.log("[processTextMessage] realtimeMode:", realtimeMode, "isRealtimeConnected:", isRealtimeConnected);
+    if (realtimeMode && isRealtimeConnected) {
+      console.log("[processTextMessage] Sending via Realtime");
+      sendRealtimeTextMessage(text);
+      return;
+    }
+    console.log("[processTextMessage] Sending via Classic API");
+
+    // Classic mode: use the /api/chat endpoint
+    setStatus("processing");
 
     try {
       // Add user message to history
@@ -264,11 +284,13 @@ export default function Home() {
       });
 
       const chatData = await chatRes.json();
+      console.log("[processTextMessage] API response:", chatData);
       if (!chatRes.ok) {
         throw new Error(chatData.error || "Failed to get response");
       }
 
       const { response: aiResponse, toolsUsed } = chatData;
+      console.log("[processTextMessage] Got response:", aiResponse?.substring(0, 100), "toolsUsed:", toolsUsed);
 
       // Add assistant message to history
       const assistantMessage: Message = {
@@ -278,7 +300,9 @@ export default function Home() {
         timestamp: Date.now(),
         toolsUsed: toolsUsed,
       };
+      console.log("[processTextMessage] Adding message to conversation:", conversationId);
       addMessage(conversationId, assistantMessage);
+      console.log("[processTextMessage] Message added successfully");
 
       // Generate title after first exchange
       if (currentMessages.length === 1) {
@@ -309,18 +333,30 @@ export default function Home() {
           audioRef.current.onended = () => {
             setStatus("idle");
             URL.revokeObjectURL(audioUrl);
+            // Refocus text input if in text mode
+            if (isTextMode) {
+              setTimeout(() => textInputRef.current?.focus(), 100);
+            }
           };
           await audioRef.current.play();
         }
       } else {
         setStatus("idle");
+        // Refocus text input if in text mode
+        if (isTextMode) {
+          setTimeout(() => textInputRef.current?.focus(), 100);
+        }
       }
     } catch (err) {
       console.error(err);
       setError(err instanceof Error ? err.message : "An error occurred");
       setStatus("idle");
+      // Refocus text input if in text mode even on error
+      if (isTextMode) {
+        setTimeout(() => textInputRef.current?.focus(), 100);
+      }
     }
-  }, [activeConversationId, createConversation, addMessage, generateTitle, audioResponseEnabled]);
+  }, [activeConversationId, createConversation, addMessage, generateTitle, audioResponseEnabled, realtimeMode, isRealtimeConnected, sendRealtimeTextMessage, isTextMode]);
 
   // Use Silero VAD for automatic voice detection
   const {
@@ -439,6 +475,21 @@ export default function Home() {
     }
   };
 
+  const getToolDisplayName = (toolName: string | null): string => {
+    switch (toolName) {
+      case "get_weather":
+        return "weather";
+      case "get_current_time":
+        return "time";
+      case "list_views":
+        return "views";
+      case "get_view_data":
+        return "data";
+      default:
+        return "data";
+    }
+  };
+
   const getStatusConfig = () => {
     // Handle Realtime mode
     if (realtimeMode) {
@@ -452,6 +503,10 @@ export default function Home() {
           return { text: "Speaking", color: "bg-emerald-500", pulse: true };
         case "processing":
           return { text: "Processing", color: "bg-amber-500", pulse: true };
+        case "tool_executing":
+          return { text: `Fetching ${getToolDisplayName(realtimeCurrentTool)}...`, color: "bg-sky-500", pulse: true };
+        case "timeout":
+          return { text: "Timed out", color: "bg-red-500", pulse: false };
         case "error":
           return { text: "Error", color: "bg-red-500", pulse: false };
         default:
@@ -540,13 +595,37 @@ export default function Home() {
                 <div className="flex-shrink-0 w-5 h-5 mt-0.5 text-red-500">
                   <AlertIcon />
                 </div>
-                <div>
+                <div className="flex-1">
                   <p className="text-sm font-medium text-red-800 dark:text-red-200">
-                    Something went wrong
+                    {realtimeStatus === "timeout" ? "Request timed out" : "Something went wrong"}
                   </p>
                   <p className="mt-1 text-sm text-red-600 dark:text-red-300">
                     {error || vadError || realtimeError}
                   </p>
+                  {/* Action buttons for realtime errors */}
+                  {realtimeMode && realtimeError && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        onClick={retryRealtime}
+                        className="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 hover:bg-red-200 dark:hover:bg-red-900/60 transition-colors"
+                      >
+                        Retry
+                      </button>
+                      {realtimeFailureCount >= 2 && (
+                        <button
+                          onClick={() => {
+                            setRealtimeMode(false);
+                            localStorage.setItem(REALTIME_MODE_KEY, "false");
+                            disconnectRealtime();
+                            setError(null);
+                          }}
+                          className="px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+                        >
+                          Switch to Classic Mode
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -598,6 +677,19 @@ export default function Home() {
                   </div>
                 </div>
               ))}
+
+              {/* Tool execution loading indicator */}
+              {realtimeMode && realtimeStatus === "tool_executing" && (
+                <div className="flex justify-start animate-slide-up">
+                  <div className="max-w-[85%] sm:max-w-[75%] px-4 py-3 bg-[var(--surface)] rounded-2xl rounded-bl-md shadow-md border border-[var(--border)]">
+                    <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
+                      <LoadingIcon className="w-4 h-4" />
+                      <span>Fetching {getToolDisplayName(realtimeCurrentTool)}...</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div ref={messagesEndRef} />
             </div>
           )}

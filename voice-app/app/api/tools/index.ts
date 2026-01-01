@@ -1,5 +1,6 @@
 import { getWeather } from "./weather";
 import { getCurrentTime } from "./time";
+import { listViews, getViewData } from "./views";
 
 export interface ToolResult {
   success: boolean;
@@ -66,6 +67,37 @@ export const tools: Tool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "list_views",
+      description:
+        "List all available views including Shopping List, Family Calendar, Tasks, Schedule, and other dashboards. MUST call this when user asks about any list, shopping, calendar, tasks, schedule, or events.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_view_data",
+      description:
+        "Get the actual items/data from a specific view. Use after list_views to retrieve Shopping List items, Calendar events, Tasks, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          view_id: {
+            type: "string",
+            description: "The UUID of the view (obtained from list_views)",
+          },
+        },
+        required: ["view_id"],
+      },
+    },
+  },
 ];
 
 export async function executeTool(
@@ -79,6 +111,10 @@ export async function executeTool(
       );
     case "get_current_time":
       return await getCurrentTime(toolInput as { timezone?: string });
+    case "list_views":
+      return await listViews();
+    case "get_view_data":
+      return await getViewData(toolInput as { view_id: string });
     default:
       return { success: false, error: `Unknown tool: ${toolName}` };
   }

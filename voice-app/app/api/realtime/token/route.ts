@@ -40,15 +40,19 @@ VOICE OUTPUT RULES:
 - Keep responses concise: 1-3 sentences unless more detail is specifically requested
 - Use natural speech patterns with appropriate pauses
 - Spell out numbers naturally (say "sixty-five degrees" not "65 degrees")
-- Avoid text formatting, bullet points, or markdown
+- NEVER use markdown formatting like **bold**, *italic*, bullet points (-), or numbered lists
+- NEVER use special characters or symbols - spell everything out for speech
 - Respond ONLY in English unless the user explicitly asks for another language
 
-TOOL USE:
-- You have access to weather and time tools
-- When asked about weather, use the get_weather tool to fetch current conditions
-- When asked about time, use the get_current_time tool
-- After using a tool, incorporate the results naturally into your spoken response
-- If a tool fails, apologize briefly and suggest an alternative
+TOOL USE - CRITICAL:
+- You have access to weather, time, and Farmboard view tools
+- ALWAYS call tools IMMEDIATELY - never ask clarifying questions before calling a tool
+- NEVER say "let me check" or "one moment" without actually calling the tool in the same response
+- For TIME: Call get_current_time with NO arguments - it automatically uses the user's local timezone. Do NOT ask which timezone they want.
+- For WEATHER: Call get_weather with the location mentioned. If no location given, ask ONCE then call immediately.
+- For views/dashboards: Call list_views first to get IDs, then get_view_data with the view_id (UUID)
+- After tool returns results, speak the answer naturally - do not narrate what you're doing
+- If a tool returns an error, briefly apologize and offer an alternative
 
 CONTENT RATING: ${contentRating}
 ${ratingGuidelines}
@@ -109,16 +113,41 @@ export async function POST(request: NextRequest) {
           {
             type: "function",
             name: "get_current_time",
-            description: "Get current time for a timezone",
+            description: "Get current time. Defaults to user's local timezone if not specified.",
             parameters: {
               type: "object",
               properties: {
                 timezone: {
                   type: "string",
-                  description: "IANA timezone (e.g., 'America/New_York')",
+                  description: "Optional IANA timezone (e.g., 'America/New_York'). If omitted, uses user's local timezone.",
                 },
               },
               required: [],
+            },
+          },
+          {
+            type: "function",
+            name: "list_views",
+            description: "List all available Farmboard views/dashboards. Returns view names, IDs, and descriptions.",
+            parameters: {
+              type: "object",
+              properties: {},
+              required: [],
+            },
+          },
+          {
+            type: "function",
+            name: "get_view_data",
+            description: "Get data from a specific Farmboard view by its ID. Use list_views first to get available view IDs.",
+            parameters: {
+              type: "object",
+              properties: {
+                view_id: {
+                  type: "string",
+                  description: "The ID of the view to fetch data from",
+                },
+              },
+              required: ["view_id"],
             },
           },
         ],
