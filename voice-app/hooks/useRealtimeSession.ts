@@ -2,6 +2,8 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import type { Message } from "@/types/conversation";
+import { getAllToolsForRealtimeApi, executeToolClient, isValidToolName } from "@/lib/tools";
+import { toVoiceFriendlyError } from "@/lib/errors";
 
 export type RealtimeStatus =
   | "disconnected"
@@ -41,181 +43,6 @@ const TIMEOUTS = {
   TOOL_EXECUTION: 15000, // 15s - max time for a tool to execute
   CONNECTION: 10000,     // 10s - max time to establish connection
 };
-
-// Tool execution functions
-async function executeWeatherTool(location: string, units?: string): Promise<string> {
-  console.log(`[Weather Tool] Starting for location: ${location}, units: ${units}`);
-  try {
-    const geocodeUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
-    console.log(`[Weather Tool] Geocoding URL: ${geocodeUrl}`);
-
-    const geocodeRes = await fetch(geocodeUrl);
-    console.log(`[Weather Tool] Geocode response status: ${geocodeRes.status}`);
-
-    if (!geocodeRes.ok) {
-      const errorText = await geocodeRes.text();
-      console.error(`[Weather Tool] Geocode API error: ${geocodeRes.status} - ${errorText}`);
-      return JSON.stringify({ error: `Geocoding API error: ${geocodeRes.status}` });
-    }
-
-    const geocodeData = await geocodeRes.json();
-    console.log(`[Weather Tool] Geocode data:`, geocodeData);
-
-    if (!geocodeData.results || geocodeData.results.length === 0) {
-      console.warn(`[Weather Tool] No results for location: ${location}`);
-      return JSON.stringify({ error: `Could not find location: ${location}` });
-    }
-
-    const { latitude, longitude, name, country } = geocodeData.results[0];
-    console.log(`[Weather Tool] Found: ${name}, ${country} at ${latitude}, ${longitude}`);
-
-    const temperatureUnit = units === "fahrenheit" ? "fahrenheit" : "celsius";
-    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&temperature_unit=${temperatureUnit}`;
-    console.log(`[Weather Tool] Weather URL: ${weatherUrl}`);
-
-    const weatherRes = await fetch(weatherUrl);
-    console.log(`[Weather Tool] Weather response status: ${weatherRes.status}`);
-
-    if (!weatherRes.ok) {
-      const errorText = await weatherRes.text();
-      console.error(`[Weather Tool] Weather API error: ${weatherRes.status} - ${errorText}`);
-      return JSON.stringify({ error: `Weather API error: ${weatherRes.status}` });
-    }
-
-    const weatherData = await weatherRes.json();
-    console.log(`[Weather Tool] Weather data:`, weatherData);
-
-    const current = weatherData.current;
-    if (!current) {
-      console.error(`[Weather Tool] No current weather data in response`);
-      return JSON.stringify({ error: "No current weather data available" });
-    }
-
-    const descriptions: Record<number, string> = {
-      0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
-      45: "Foggy", 48: "Rime fog", 51: "Light drizzle", 53: "Moderate drizzle",
-      55: "Dense drizzle", 61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
-      71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow", 80: "Rain showers",
-      95: "Thunderstorm", 96: "Thunderstorm with hail",
-    };
-
-    const result = {
-      location: `${name}, ${country}`,
-      temperature: current.temperature_2m,
-      feels_like: current.apparent_temperature,
-      humidity: current.relative_humidity_2m,
-      wind_speed: current.wind_speed_10m,
-      conditions: descriptions[current.weather_code] || "Unknown",
-      units: temperatureUnit,
-    };
-    console.log(`[Weather Tool] Success:`, result);
-    return JSON.stringify(result);
-  } catch (error) {
-    console.error("[Weather Tool] Exception:", error);
-    const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    return JSON.stringify({ error: `Failed to fetch weather: ${errorMessage}` });
-  }
-}
-
-async function executeTimeTool(timezone?: string): Promise<string> {
-  try {
-    // Default to user's local timezone if not specified
-    const tz = timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
-
-    try {
-      new Intl.DateTimeFormat("en-US", { timeZone: tz });
-    } catch {
-      return JSON.stringify({ error: `Invalid timezone: ${tz}` });
-    }
-
-    const now = new Date();
-    const formatter = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      weekday: "long",
-      year: "numeric",
-      month: "long",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true,
-    });
-
-    return JSON.stringify({
-      timezone: tz,
-      formatted: formatter.format(now),
-      iso: now.toISOString(),
-    });
-  } catch (error) {
-    console.error("Time tool error:", error);
-    return JSON.stringify({ error: "Failed to get current time" });
-  }
-}
-
-async function executeListViewsTool(): Promise<string> {
-  try {
-    // Use local proxy to avoid CORS issues
-    const response = await fetch("/api/farmboard/views");
-    if (!response.ok) {
-      return JSON.stringify({ error: `Failed to fetch views: ${response.status}` });
-    }
-    const data = await response.json();
-
-    // Extract just the essential info for voice output
-    if (Array.isArray(data)) {
-      const views = data.map((view: { id: string; name: string; description?: string }) => ({
-        id: view.id,
-        name: view.name,
-        description: view.description || null,
-      }));
-      return JSON.stringify({ views, count: views.length });
-    }
-
-    return JSON.stringify(data);
-  } catch (error) {
-    console.error("List views tool error:", error);
-    return JSON.stringify({ error: "Failed to fetch views" });
-  }
-}
-
-async function executeGetViewDataTool(viewId: string): Promise<string> {
-  try {
-    // Use local proxy to avoid CORS issues
-    const response = await fetch(`/api/farmboard/view/${viewId}`);
-    if (!response.ok) {
-      return JSON.stringify({ error: `Failed to fetch view data: ${response.status}` });
-    }
-    const data = await response.json();
-
-    // Summarize the data for voice output
-    if (data && typeof data === "object") {
-      const summary: Record<string, unknown> = {};
-
-      // Include view metadata if present
-      if (data.name) summary.name = data.name;
-      if (data.description) summary.description = data.description;
-
-      // Return all items from the view
-      if (Array.isArray(data.data)) {
-        summary.rowCount = data.data.length;
-        summary.columns = data.data[0] ? Object.keys(data.data[0]) : [];
-        summary.items = data.data;
-      } else if (Array.isArray(data)) {
-        summary.rowCount = data.length;
-        summary.columns = data[0] ? Object.keys(data[0]) : [];
-        summary.items = data;
-      } else {
-        summary.data = data;
-      }
-
-      return JSON.stringify(summary);
-    }
-
-    return JSON.stringify(data);
-  } catch (error) {
-    console.error("Get view data tool error:", error);
-    return JSON.stringify({ error: "Failed to fetch view data" });
-  }
-}
 
 export function useRealtimeSession(
   options: UseRealtimeSessionOptions = {}
@@ -287,13 +114,17 @@ export function useRealtimeSession(
     console.error(`[Realtime] Timeout: ${reason}`);
     clearTimeouts();
     setFailureCount(prev => prev + 1);
-    setError(`Request timed out: ${reason}`);
+    const friendlyError = toVoiceFriendlyError(`Request timed out: ${reason}`);
+    const errorMessage = friendlyError.suggestion
+      ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+      : friendlyError.userMessage;
+    setError(errorMessage);
     setStatus("timeout");
     setCurrentTool(null);
     responseInProgressRef.current = false;
     pendingToolResultsRef.current = [];
     onTimeoutRef.current?.();
-    onErrorRef.current?.(`Request timed out: ${reason}`);
+    onErrorRef.current?.(errorMessage);
   }, [clearTimeouts]);
 
   // Start response timeout - expecting a response within TIMEOUTS.RESPONSE
@@ -521,15 +352,9 @@ export function useRealtimeSession(
               const args = JSON.parse(argsJson);
               console.log(`[Realtime] Parsed args:`, args);
 
-              if (name === "get_weather") {
-                result = await executeWeatherTool(args.location, args.units);
-              } else if (name === "get_current_time") {
-                result = await executeTimeTool(args.timezone);
-              } else if (name === "list_views") {
-                result = await executeListViewsTool();
-              } else if (name === "get_view_data") {
-                console.log(`[Realtime] Calling get_view_data with view_id:`, args.view_id);
-                result = await executeGetViewDataTool(args.view_id);
+              // Use centralized tool executor
+              if (isValidToolName(name)) {
+                result = await executeToolClient(name, args);
               } else {
                 result = JSON.stringify({ error: `Unknown tool: ${name}` });
               }
@@ -563,13 +388,17 @@ export function useRealtimeSession(
 
           case "error": {
             // OpenAI Realtime API error format can vary
-            const errorMessage =
+            const technicalError =
               data.error?.message ||
               data.message ||
               (typeof data.error === "string" ? data.error : null) ||
               "Realtime API error";
             const errorCode = data.error?.code || data.code || "unknown";
-            console.error("[Realtime] Error:", { message: errorMessage, code: errorCode, raw: data });
+            console.error("[Realtime] Error:", { message: technicalError, code: errorCode, raw: data });
+            const friendlyError = toVoiceFriendlyError(technicalError);
+            const errorMessage = friendlyError.suggestion
+              ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+              : friendlyError.userMessage;
             setError(errorMessage);
             onErrorRef.current?.(errorMessage);
             break;
@@ -636,74 +465,16 @@ export function useRealtimeSession(
         console.log("[Realtime] Data channel opened");
         updateStatus("connected");
 
+        // Get tools from centralized registry
+        const tools = getAllToolsForRealtimeApi();
+
         // Send session.update to configure tools
         // This ensures tools are available even if the token creation didn't fully apply them
         dc.send(JSON.stringify({
           type: "session.update",
           session: {
-            tools: [
-              {
-                type: "function",
-                name: "get_weather",
-                description: "Get current weather for a location",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    location: {
-                      type: "string",
-                      description: "City name (e.g., 'San Francisco', 'London', 'Sydney')",
-                    },
-                    units: {
-                      type: "string",
-                      enum: ["celsius", "fahrenheit"],
-                      description: "Temperature units",
-                    },
-                  },
-                  required: ["location"],
-                },
-              },
-              {
-                type: "function",
-                name: "get_current_time",
-                description: "Get current time. Defaults to user's local timezone if not specified.",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    timezone: {
-                      type: "string",
-                      description: "Optional IANA timezone (e.g., 'America/New_York'). If omitted, uses user's local timezone.",
-                    },
-                  },
-                  required: [],
-                },
-              },
-              {
-                type: "function",
-                name: "list_views",
-                description: "List all available views including Shopping List, Calendar, Tasks, and other dashboards. Call this when user asks about any list, schedule, tasks, or dashboard. Returns view names and IDs.",
-                parameters: {
-                  type: "object",
-                  properties: {},
-                  required: [],
-                },
-              },
-              {
-                type: "function",
-                name: "get_view_data",
-                description: "Get the actual data/items from a view. Call this after list_views to get contents of Shopping List, Calendar events, Tasks, etc.",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    view_id: {
-                      type: "string",
-                      description: "The UUID of the view (get this from list_views)",
-                    },
-                  },
-                  required: ["view_id"],
-                },
-              },
-            ],
-            tool_choice: "required",
+            tools,
+            tool_choice: "auto",
           },
         }));
         console.log("[Realtime] Sent session.update with tools");
@@ -770,7 +541,11 @@ export function useRealtimeSession(
       console.log("[Realtime] WebRTC connection established");
     } catch (err) {
       console.error("Failed to connect:", err);
-      const errorMessage = err instanceof Error ? err.message : "Connection failed";
+      const technicalError = err instanceof Error ? err.message : "Connection failed";
+      const friendlyError = toVoiceFriendlyError(technicalError);
+      const errorMessage = friendlyError.suggestion
+        ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+        : friendlyError.userMessage;
       setError(errorMessage);
       onErrorRef.current?.(errorMessage);
       updateStatus("error");
@@ -858,7 +633,10 @@ export function useRealtimeSession(
       sendTextMessage(lastMessageRef.current);
     } else if (lastMessageRef.current) {
       // Connection might be dead, surface this to user
-      setError("Cannot retry - connection lost. Please reconnect.");
+      const friendlyError = toVoiceFriendlyError("Cannot retry - connection lost. Please reconnect.");
+      setError(friendlyError.suggestion
+        ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+        : friendlyError.userMessage);
     }
   }, [sendTextMessage]);
 

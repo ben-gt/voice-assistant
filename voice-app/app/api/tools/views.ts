@@ -1,3 +1,5 @@
+import { toVoiceFriendlyError, getHttpStatusMessage } from "@/lib/errors";
+
 export interface ToolResult {
   success: boolean;
   data?: unknown;
@@ -16,9 +18,12 @@ export async function listViews(): Promise<ToolResult> {
   try {
     const response = await fetch(`${FARMBOARD_BASE_URL}/api/settings/views`);
     if (!response.ok) {
+      const friendlyError = getHttpStatusMessage(response.status, "list views");
       return {
         success: false,
-        error: `Failed to fetch views: ${response.status}`,
+        error: friendlyError.suggestion
+          ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+          : friendlyError.userMessage,
       };
     }
     const data = await response.json();
@@ -40,7 +45,13 @@ export async function listViews(): Promise<ToolResult> {
     return { success: true, data };
   } catch (error) {
     console.error("List views tool error:", error);
-    return { success: false, error: "Failed to fetch views" };
+    const friendlyError = toVoiceFriendlyError("Failed to fetch views", "list_views");
+    return {
+      success: false,
+      error: friendlyError.suggestion
+        ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+        : friendlyError.userMessage,
+    };
   }
 }
 
@@ -52,9 +63,25 @@ export async function getViewData(input: GetViewDataInput): Promise<ToolResult> 
   try {
     const response = await fetch(`${FARMBOARD_BASE_URL}/api/view/${input.view_id}`);
     if (!response.ok) {
+      // Special handling for 404 - the view wasn't found
+      if (response.status === 404) {
+        const friendlyError = toVoiceFriendlyError(
+          `Failed to fetch view data: 404`,
+          "get_view_data"
+        );
+        return {
+          success: false,
+          error: friendlyError.suggestion
+            ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+            : friendlyError.userMessage,
+        };
+      }
+      const friendlyError = getHttpStatusMessage(response.status, "view data");
       return {
         success: false,
-        error: `Failed to fetch view data: ${response.status}`,
+        error: friendlyError.suggestion
+          ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+          : friendlyError.userMessage,
       };
     }
     const data = await response.json();
@@ -83,6 +110,12 @@ export async function getViewData(input: GetViewDataInput): Promise<ToolResult> 
     return { success: true, data };
   } catch (error) {
     console.error("Get view data tool error:", error);
-    return { success: false, error: "Failed to fetch view data" };
+    const friendlyError = toVoiceFriendlyError("Failed to fetch view data", "get_view_data");
+    return {
+      success: false,
+      error: friendlyError.suggestion
+        ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+        : friendlyError.userMessage,
+    };
   }
 }

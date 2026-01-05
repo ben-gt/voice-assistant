@@ -6,10 +6,23 @@ import { useSileroVAD, VADState } from "@/hooks/useSileroVAD";
 import { useInterruptionDetector } from "@/hooks/useInterruptionDetector";
 import { useConversations } from "@/hooks/useConversations";
 import { useRealtimeSession, RealtimeStatus } from "@/hooks/useRealtimeSession";
+import { useBrowserLocation } from "@/hooks/useBrowserLocation";
 import { ConversationBubbles } from "@/components/ConversationBubbles";
+import { toVoiceFriendlyError } from "@/lib/errors";
+import ReactMarkdown from "react-markdown";
 import type { Message } from "@/types/conversation";
 
-type Status = "idle" | "listening" | "speaking" | "processing" | "playing";
+type Status = "idle" | "listening" | "speaking" | "processing" | "playing" | "tool_executing";
+
+// Stream event types from the chat API
+type ChatStreamEvent =
+  | { type: "tool_start"; tool: string; toolIndex?: number; totalTools?: number }
+  | { type: "tool_end"; tool: string }
+  | { type: "plan_info"; totalTools: number; tools: string[] }
+  | { type: "speculative_status"; usedSpeculative: boolean; latencySavedMs: number }
+  | { type: "token"; token: string }
+  | { type: "response"; response: string; toolsUsed?: string[] }
+  | { type: "error"; error: string };
 
 const VOICE_STORAGE_KEY = "voice-assistant-selected-voice";
 const AUDIO_RESPONSE_KEY = "voice-assistant-audio-response";
@@ -25,9 +38,51 @@ export default function Home() {
   const [textInput, setTextInput] = useState("");
   const [isTextMode, setIsTextMode] = useState(false);
   const [realtimeMode, setRealtimeMode] = useState(false);
+  const [currentTool, setCurrentTool] = useState<string | null>(null); // Track current tool in Classic mode
+  const [toolProgress, setToolProgress] = useState<{ current: number; total: number } | null>(null); // Track tool execution progress
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textInputRef = useRef<HTMLInputElement | null>(null);
+  const hasSpokenAcknowledgmentRef = useRef(false); // Track if we've spoken acknowledgment for current request
+
+  // Quick acknowledgment phrases (varied to feel more natural)
+  const acknowledgmentPhrases = [
+    "Let me check.",
+    "One moment.",
+    "Looking that up.",
+    "Checking now.",
+  ];
+
+  /**
+   * Speak a quick acknowledgment when tools start executing.
+   * Uses Web Speech API for instant response (no network delay).
+   */
+  const speakAcknowledgment = useCallback(() => {
+    if (!audioResponseEnabled) return;
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+
+    // Pick a random phrase
+    const phrase = acknowledgmentPhrases[Math.floor(Math.random() * acknowledgmentPhrases.length)];
+
+    const utterance = new SpeechSynthesisUtterance(phrase);
+    utterance.rate = 1.1; // Slightly faster
+    utterance.volume = 0.8; // Slightly quieter than main response
+    utterance.pitch = 1.0;
+
+    // Try to use a natural-sounding voice if available
+    const voices = window.speechSynthesis.getVoices();
+    const preferredVoice = voices.find(v =>
+      v.name.includes("Samantha") || // macOS
+      v.name.includes("Google") ||   // Chrome
+      v.name.includes("Microsoft") || // Windows
+      v.lang.startsWith("en")
+    );
+    if (preferredVoice) {
+      utterance.voice = preferredVoice;
+    }
+
+    window.speechSynthesis.speak(utterance);
+  }, [audioResponseEnabled]);
 
   const {
     conversations,
@@ -40,6 +95,9 @@ export default function Home() {
     generateTitle,
   } = useConversations();
 
+  // Get browser location for location-based tools
+  const { location: browserLocation } = useBrowserLocation();
+
   const messages = activeConversation?.messages || [];
 
   // Keep a ref to the latest messages to avoid stale closures in callbacks
@@ -50,6 +108,123 @@ export default function Home() {
 
   // Track which messages we've seen from realtime to avoid duplicates
   const seenRealtimeMessagesRef = useRef<Set<string>>(new Set());
+
+  /**
+   * Fetch chat response with streaming for tool execution feedback
+   * Returns the final response data or throws an error
+   */
+  const fetchChatWithStreaming = useCallback(async (
+    messages: { role: string; content: string }[],
+    contentRating: string,
+    onToolStart?: (tool: string) => void,
+    onToolEnd?: (tool: string) => void
+  ): Promise<{ response: string; toolsUsed?: string[] }> => {
+    const lastUserMessage = messages[messages.length - 1]?.content || "";
+    console.log(`[Chat] Sending request - User: "${lastUserMessage}"`);
+    console.log(`[Chat] Location: ${browserLocation?.city || "unknown"}, ${browserLocation?.region || ""}`);
+
+    // Reset acknowledgment flag for new request
+    hasSpokenAcknowledgmentRef.current = false;
+
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+      },
+      body: JSON.stringify({
+        messages,
+        contentRating,
+        // Pass browser location to server for location-based tools
+        clientLocation: browserLocation || undefined,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || "Failed to get response");
+    }
+
+    // Handle SSE stream
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error("No response body");
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalResult: { response: string; toolsUsed?: string[] } | null = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // Process complete SSE messages
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop() || ""; // Keep incomplete message in buffer
+
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          try {
+            const event: ChatStreamEvent = JSON.parse(line.slice(6));
+
+            switch (event.type) {
+              case "plan_info":
+                console.log(`[Chat] Plan received: ${event.totalTools} tool(s) - ${event.tools.join(", ")}`);
+                // Track total tools for progress display
+                setToolProgress({ current: 0, total: event.totalTools });
+                break;
+              case "tool_start":
+                console.log(`[Chat] Tool started: ${event.tool}${event.toolIndex ? ` (${event.toolIndex}/${event.totalTools})` : ""}`);
+                // Update progress with current tool index
+                if (event.toolIndex && event.totalTools) {
+                  setToolProgress({ current: event.toolIndex, total: event.totalTools });
+                }
+                // Speak acknowledgment on first tool start (avoid awkward silence)
+                if (!hasSpokenAcknowledgmentRef.current) {
+                  hasSpokenAcknowledgmentRef.current = true;
+                  speakAcknowledgment();
+                }
+                onToolStart?.(event.tool);
+                break;
+              case "tool_end":
+                console.log(`[Chat] Tool ended: ${event.tool}`);
+                onToolEnd?.(event.tool);
+                break;
+              case "speculative_status":
+                console.log(`[Chat] Speculative: used=${event.usedSpeculative}, saved=${event.latencySavedMs?.toFixed(0)}ms`);
+                break;
+              case "token":
+                // Token streaming - could be used for real-time response display
+                // Currently just logging, but could update partial response state
+                break;
+              case "response":
+                console.log(`[Chat] Response received - Tools: ${event.toolsUsed?.join(", ") || "none"}`);
+                console.log(`[Chat] Assistant: "${event.response}"`);
+                finalResult = { response: event.response, toolsUsed: event.toolsUsed };
+                // Clear progress when done
+                setToolProgress(null);
+                break;
+              case "error":
+                console.error(`[Chat] Error: ${event.error}`);
+                setToolProgress(null);
+                throw new Error(event.error);
+            }
+          } catch (parseError) {
+            console.error("[Chat] Failed to parse SSE event:", parseError);
+          }
+        }
+      }
+    }
+
+    if (!finalResult) {
+      throw new Error("No response received from chat API");
+    }
+
+    return finalResult;
+  }, [browserLocation, speakAcknowledgment]);
 
   // Realtime session hook
   const {
@@ -163,23 +338,22 @@ export default function Home() {
       // Get current messages for API call (use ref to avoid stale closure)
       const currentMessages = [...messagesRef.current, userMessage];
 
-      // Step 2: Get AI response with full conversation context
+      // Step 2: Get AI response with full conversation context (with streaming for tool feedback)
       const contentRating = localStorage.getItem(CONTENT_RATING_KEY) || "M";
-      const chatRes = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: currentMessages.map(m => ({ role: m.role, content: m.content })),
-          contentRating,
-        }),
-      });
-
-      const chatData = await chatRes.json();
-      if (!chatRes.ok) {
-        throw new Error(chatData.error || "Failed to get response");
-      }
-
-      const { response: aiResponse, toolsUsed } = chatData;
+      const { response: aiResponse, toolsUsed } = await fetchChatWithStreaming(
+        currentMessages.map(m => ({ role: m.role, content: m.content })),
+        contentRating,
+        // onToolStart - show tool-specific status
+        (tool) => {
+          setStatus("tool_executing");
+          setCurrentTool(tool);
+        },
+        // onToolEnd - back to processing
+        () => {
+          setCurrentTool(null);
+          setStatus("processing");
+        }
+      );
 
       // Add assistant message to history
       const assistantMessage: Message = {
@@ -228,10 +402,14 @@ export default function Home() {
       }
     } catch (err) {
       console.error(err);
-      setError(err instanceof Error ? err.message : "An error occurred");
+      const errorMessage = err instanceof Error ? err.message : "An error occurred";
+      const friendlyError = toVoiceFriendlyError(errorMessage);
+      setError(friendlyError.suggestion
+        ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+        : friendlyError.userMessage);
       setStatus("idle");
     }
-  }, [activeConversationId, createConversation, addMessage, generateTitle, audioResponseEnabled]);
+  }, [activeConversationId, createConversation, addMessage, generateTitle, audioResponseEnabled, fetchChatWithStreaming]);
 
   // Process text message (for typed input)
   const processTextMessage = useCallback(async (text: string) => {
@@ -248,13 +426,13 @@ export default function Home() {
 
     // In Realtime mode with active connection, send through WebRTC
     // Otherwise use the Classic API (no microphone needed for text input)
-    console.log("[processTextMessage] realtimeMode:", realtimeMode, "isRealtimeConnected:", isRealtimeConnected);
+    const mode = realtimeMode && isRealtimeConnected ? "Realtime" : "Classic";
+    console.log(`[Chat] Mode: ${mode} | Realtime: ${realtimeMode} | Connected: ${isRealtimeConnected}`);
+
     if (realtimeMode && isRealtimeConnected) {
-      console.log("[processTextMessage] Sending via Realtime");
       sendRealtimeTextMessage(text);
       return;
     }
-    console.log("[processTextMessage] Sending via Classic API");
 
     // Classic mode: use the /api/chat endpoint
     setStatus("processing");
@@ -272,26 +450,22 @@ export default function Home() {
       // Get current messages for API call (use ref to avoid stale closure)
       const currentMessages = [...messagesRef.current, userMessage];
 
-      // Get AI response with full conversation context
+      // Get AI response with full conversation context (with streaming for tool feedback)
       const contentRating = localStorage.getItem(CONTENT_RATING_KEY) || "M";
-      const chatRes = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: currentMessages.map(m => ({ role: m.role, content: m.content })),
-          contentRating,
-        }),
-      });
-
-      const chatData = await chatRes.json();
-      console.log("[processTextMessage] API response:", chatData);
-      if (!chatRes.ok) {
-        throw new Error(chatData.error || "Failed to get response");
-      }
-
-      const { response: aiResponse, toolsUsed } = chatData;
-      console.log("[processTextMessage] Got response:", aiResponse?.substring(0, 100), "toolsUsed:", toolsUsed);
-
+      const { response: aiResponse, toolsUsed } = await fetchChatWithStreaming(
+        currentMessages.map(m => ({ role: m.role, content: m.content })),
+        contentRating,
+        // onToolStart - show tool-specific status
+        (tool) => {
+          setStatus("tool_executing");
+          setCurrentTool(tool);
+        },
+        // onToolEnd - back to processing
+        () => {
+          setCurrentTool(null);
+          setStatus("processing");
+        }
+      );
       // Add assistant message to history
       const assistantMessage: Message = {
         id: crypto.randomUUID(),
@@ -300,9 +474,7 @@ export default function Home() {
         timestamp: Date.now(),
         toolsUsed: toolsUsed,
       };
-      console.log("[processTextMessage] Adding message to conversation:", conversationId);
       addMessage(conversationId, assistantMessage);
-      console.log("[processTextMessage] Message added successfully");
 
       // Generate title after first exchange
       if (currentMessages.length === 1) {
@@ -349,14 +521,18 @@ export default function Home() {
       }
     } catch (err) {
       console.error(err);
-      setError(err instanceof Error ? err.message : "An error occurred");
+      const errorMessage = err instanceof Error ? err.message : "An error occurred";
+      const friendlyError = toVoiceFriendlyError(errorMessage);
+      setError(friendlyError.suggestion
+        ? `${friendlyError.userMessage} ${friendlyError.suggestion}`
+        : friendlyError.userMessage);
       setStatus("idle");
       // Refocus text input if in text mode even on error
       if (isTextMode) {
         setTimeout(() => textInputRef.current?.focus(), 100);
       }
     }
-  }, [activeConversationId, createConversation, addMessage, generateTitle, audioResponseEnabled, realtimeMode, isRealtimeConnected, sendRealtimeTextMessage, isTextMode]);
+  }, [activeConversationId, createConversation, addMessage, generateTitle, audioResponseEnabled, realtimeMode, isRealtimeConnected, sendRealtimeTextMessage, isTextMode, fetchChatWithStreaming]);
 
   // Use Silero VAD for automatic voice detection
   const {
@@ -485,6 +661,10 @@ export default function Home() {
         return "views";
       case "get_view_data":
         return "data";
+      case "fetch_url":
+        return "page";
+      case "web_search":
+        return "web";
       default:
         return "data";
     }
@@ -526,6 +706,13 @@ export default function Home() {
     switch (status) {
       case "processing":
         return { text: "Processing", color: "bg-amber-500", pulse: true };
+      case "tool_executing": {
+        const toolName = getToolDisplayName(currentTool);
+        const progressText = toolProgress && toolProgress.total > 1
+          ? ` (${toolProgress.current}/${toolProgress.total})`
+          : "";
+        return { text: `Fetching ${toolName}${progressText}...`, color: "bg-sky-500", pulse: true };
+      }
       case "playing":
         return { text: "Speaking", color: "bg-emerald-500", pulse: true };
       default:
@@ -585,21 +772,18 @@ export default function Home() {
       {/* Main Content - Scrollable Messages Area */}
       <main className="flex-1 overflow-y-auto px-4 sm:px-6 py-4">
         <div className="max-w-2xl mx-auto">
-          {/* Error Display */}
+          {/* Error Display - Voice-friendly format */}
           {(error || vadError || realtimeError) && (
             <div
-              className="mb-4 p-4 bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800/50 rounded-xl animate-fade-in"
+              className="mb-4 p-4 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/50 rounded-xl animate-fade-in"
               role="alert"
             >
               <div className="flex items-start gap-3">
-                <div className="flex-shrink-0 w-5 h-5 mt-0.5 text-red-500">
-                  <AlertIcon />
+                <div className="flex-shrink-0 w-8 h-8 mt-0.5 rounded-full bg-amber-100 dark:bg-amber-900/50 flex items-center justify-center">
+                  <SpeechBubbleIcon className="w-4 h-4 text-amber-600 dark:text-amber-400" />
                 </div>
                 <div className="flex-1">
-                  <p className="text-sm font-medium text-red-800 dark:text-red-200">
-                    {realtimeStatus === "timeout" ? "Request timed out" : "Something went wrong"}
-                  </p>
-                  <p className="mt-1 text-sm text-red-600 dark:text-red-300">
+                  <p className="text-sm text-amber-800 dark:text-amber-200 leading-relaxed">
                     {error || vadError || realtimeError}
                   </p>
                   {/* Action buttons for realtime errors */}
@@ -607,9 +791,9 @@ export default function Home() {
                     <div className="mt-3 flex flex-wrap gap-2">
                       <button
                         onClick={retryRealtime}
-                        className="px-3 py-1.5 text-xs font-medium rounded-lg bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 hover:bg-red-200 dark:hover:bg-red-900/60 transition-colors"
+                        className="px-3 py-1.5 text-xs font-medium rounded-lg bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-900/60 transition-colors"
                       >
-                        Retry
+                        Try Again
                       </button>
                       {realtimeFailureCount >= 2 && (
                         <button
@@ -627,6 +811,14 @@ export default function Home() {
                     </div>
                   )}
                 </div>
+                {/* Dismiss button */}
+                <button
+                  onClick={() => setError(null)}
+                  className="flex-shrink-0 p-1 rounded-lg text-amber-400 dark:text-amber-500 hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors"
+                  aria-label="Dismiss"
+                >
+                  <CloseIcon className="w-4 h-4" />
+                </button>
               </div>
             </div>
           )}
@@ -661,7 +853,9 @@ export default function Home() {
                         : "bg-[var(--surface)] text-[var(--text-primary)] rounded-2xl rounded-bl-md shadow-md border border-[var(--border)]"
                     }`}
                   >
-                    <p className="text-sm leading-relaxed">{stripThinkingTags(message.content)}</p>
+                    <div className="text-sm leading-relaxed prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-a:text-indigo-400 prose-a:no-underline hover:prose-a:underline">
+                      <ReactMarkdown>{stripThinkingTags(message.content)}</ReactMarkdown>
+                    </div>
                     <div className={`flex items-center gap-2 mt-2 ${
                       message.role === "user"
                         ? "text-indigo-200"
@@ -678,13 +872,25 @@ export default function Home() {
                 </div>
               ))}
 
-              {/* Tool execution loading indicator */}
+              {/* Tool execution loading indicator - Realtime mode */}
               {realtimeMode && realtimeStatus === "tool_executing" && (
                 <div className="flex justify-start animate-slide-up">
                   <div className="max-w-[85%] sm:max-w-[75%] px-4 py-3 bg-[var(--surface)] rounded-2xl rounded-bl-md shadow-md border border-[var(--border)]">
                     <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
                       <LoadingIcon className="w-4 h-4" />
                       <span>Fetching {getToolDisplayName(realtimeCurrentTool)}...</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Tool execution loading indicator - Classic mode */}
+              {!realtimeMode && status === "tool_executing" && (
+                <div className="flex justify-start animate-slide-up">
+                  <div className="max-w-[85%] sm:max-w-[75%] px-4 py-3 bg-[var(--surface)] rounded-2xl rounded-bl-md shadow-md border border-[var(--border)]">
+                    <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
+                      <LoadingIcon className="w-4 h-4" />
+                      <span>Fetching {getToolDisplayName(currentTool)}...</span>
                     </div>
                   </div>
                 </div>
@@ -767,7 +973,7 @@ export default function Home() {
                   {/* Voice Button */}
                   <button
                     onClick={handleButtonClick}
-                    disabled={realtimeMode ? realtimeStatus === "connecting" : (status === "processing" || isVADLoading)}
+                    disabled={realtimeMode ? realtimeStatus === "connecting" : (status === "processing" || status === "tool_executing" || isVADLoading)}
                     className={`relative w-16 h-16 sm:w-20 sm:h-20 rounded-full flex items-center justify-center transition-all duration-300 shadow-lg hover:shadow-xl focus:outline-none focus-visible:ring-4 focus-visible:ring-[var(--border-focus)] ${
                       realtimeMode
                         ? // Realtime mode styles
@@ -791,6 +997,8 @@ export default function Home() {
                         ? "bg-gradient-to-br from-red-500 to-orange-500 cursor-pointer hover:scale-105 active:scale-95 animate-pulse"
                         : status === "processing"
                         ? "bg-gradient-to-br from-amber-400 to-orange-500 cursor-not-allowed"
+                        : status === "tool_executing"
+                        ? "bg-gradient-to-br from-sky-400 to-blue-500 cursor-not-allowed"
                         : status === "playing"
                         ? "bg-gradient-to-br from-emerald-400 to-teal-500 cursor-pointer hover:scale-105 active:scale-95"
                         : "bg-gradient-to-br from-indigo-500 to-violet-600"
@@ -840,6 +1048,8 @@ export default function Home() {
                         ) : isUserSpeaking ? (
                           <StopIcon className="w-7 h-7 sm:w-8 sm:h-8 text-white" />
                         ) : status === "processing" ? (
+                          <LoadingIcon className="w-7 h-7 sm:w-8 sm:h-8 text-white" />
+                        ) : status === "tool_executing" ? (
                           <LoadingIcon className="w-7 h-7 sm:w-8 sm:h-8 text-white" />
                         ) : status === "playing" ? (
                           <SoundWaveIcon className="w-7 h-7 sm:w-8 sm:h-8 text-white" />
@@ -1012,6 +1222,23 @@ function AlertIcon() {
       <circle cx="12" cy="12" r="10" />
       <line x1="12" x2="12" y1="8" y2="12" />
       <line x1="12" x2="12.01" y1="16" y2="16" />
+    </svg>
+  );
+}
+
+function SpeechBubbleIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </svg>
+  );
+}
+
+function CloseIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
     </svg>
   );
 }

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getAllToolsForRealtimeApi } from "@/lib/tools";
 
 type ContentRating = "G" | "PG" | "M" | "MA" | "R";
 
@@ -44,15 +45,36 @@ VOICE OUTPUT RULES:
 - NEVER use special characters or symbols - spell everything out for speech
 - Respond ONLY in English unless the user explicitly asks for another language
 
-TOOL USE - CRITICAL:
-- You have access to weather, time, and Farmboard view tools
-- ALWAYS call tools IMMEDIATELY - never ask clarifying questions before calling a tool
-- NEVER say "let me check" or "one moment" without actually calling the tool in the same response
-- For TIME: Call get_current_time with NO arguments - it automatically uses the user's local timezone. Do NOT ask which timezone they want.
-- For WEATHER: Call get_weather with the location mentioned. If no location given, ask ONCE then call immediately.
-- For views/dashboards: Call list_views first to get IDs, then get_view_data with the view_id (UUID)
-- After tool returns results, speak the answer naturally - do not narrate what you're doing
-- If a tool returns an error, briefly apologize and offer an alternative
+=== MANDATORY TOOL USE - YOU MUST FOLLOW THESE RULES ===
+
+ABSOLUTE REQUIREMENT: You MUST use tools for ANY query about factual, real-time, or current information.
+DO NOT EVER respond with factual information without first calling the appropriate tool.
+Your training data is OUTDATED - you do NOT know the current date, time, weather, or any current facts.
+
+TRIGGER WORDS -> REQUIRED TOOLS:
+- "what time" / "what's the time" / "current time" / "time now" -> MUST call get_current_time
+- "what day" / "what date" / "today" / "what's today" / "current date" -> MUST call get_current_time
+- "weather" / "temperature" / "forecast" / "how hot" / "how cold" / "raining" -> MUST call get_weather
+- "shopping list" / "calendar" / "tasks" / "schedule" / "events" -> MUST call list_views then get_view_data
+- URL or website content -> MUST call fetch_url
+- "search" / "look up" / "find" / opening hours / prices / news / current events -> MUST call web_search
+
+CRITICAL - TIME AND DATE QUERIES:
+- You DO NOT know what day it is. You MUST call get_current_time.
+- You DO NOT know the current date. You MUST call get_current_time.
+- You DO NOT know the current time. You MUST call get_current_time.
+- If the user mentions ANY location in this conversation, use that location's timezone.
+- Pass the timezone or location parameter based on conversation context.
+NEVER HALLUCINATE DATES OR TIMES. If you respond with a date without calling get_current_time, you are WRONG.
+
+TOOL EXECUTION RULES:
+- Call the tool FIRST, then respond with the data
+- NEVER say "let me check" or "one moment" - just call the tool
+- NEVER claim you searched or found information without actually calling a tool
+- After the tool returns data, speak the results naturally
+- If a tool fails, briefly apologize and say you couldn't find the information
+
+IMPORTANT: For business hours, prices, current events, or any real-time info, you MUST call web_search. Your knowledge may be outdated.
 
 CONTENT RATING: ${contentRating}
 ${ratingGuidelines}
@@ -67,6 +89,9 @@ export async function POST(request: NextRequest) {
     };
 
     const instructions = buildRealtimeInstructions(contentRating);
+
+    // Get tools from centralized registry in Realtime API format
+    const tools = getAllToolsForRealtimeApi();
 
     // Create ephemeral token via OpenAI REST API
     const response = await fetch("https://api.openai.com/v1/realtime/sessions", {
@@ -89,68 +114,7 @@ export async function POST(request: NextRequest) {
           prefix_padding_ms: 300,
           silence_duration_ms: 500,
         },
-        tools: [
-          {
-            type: "function",
-            name: "get_weather",
-            description: "Get current weather for a location",
-            parameters: {
-              type: "object",
-              properties: {
-                location: {
-                  type: "string",
-                  description: "City name (e.g., 'San Francisco', 'London')",
-                },
-                units: {
-                  type: "string",
-                  enum: ["celsius", "fahrenheit"],
-                  description: "Temperature units",
-                },
-              },
-              required: ["location"],
-            },
-          },
-          {
-            type: "function",
-            name: "get_current_time",
-            description: "Get current time. Defaults to user's local timezone if not specified.",
-            parameters: {
-              type: "object",
-              properties: {
-                timezone: {
-                  type: "string",
-                  description: "Optional IANA timezone (e.g., 'America/New_York'). If omitted, uses user's local timezone.",
-                },
-              },
-              required: [],
-            },
-          },
-          {
-            type: "function",
-            name: "list_views",
-            description: "List all available Farmboard views/dashboards. Returns view names, IDs, and descriptions.",
-            parameters: {
-              type: "object",
-              properties: {},
-              required: [],
-            },
-          },
-          {
-            type: "function",
-            name: "get_view_data",
-            description: "Get data from a specific Farmboard view by its ID. Use list_views first to get available view IDs.",
-            parameters: {
-              type: "object",
-              properties: {
-                view_id: {
-                  type: "string",
-                  description: "The ID of the view to fetch data from",
-                },
-              },
-              required: ["view_id"],
-            },
-          },
-        ],
+        tools,
       }),
     });
 
